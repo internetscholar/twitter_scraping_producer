@@ -1,13 +1,12 @@
 import boto3
-import pendulum
-from datetime import datetime
 import psycopg2
 from psycopg2 import extras
 import json
 import configparser
 import os
 
-if __name__ == '__main__':
+
+def main():
     # Connect to Postgres server.
     config = configparser.ConfigParser()
     config.read(os.path.join(os.path.dirname(__file__), 'config.ini'))
@@ -26,53 +25,57 @@ if __name__ == '__main__':
         region_name=aws_credential['region_name']
     )
     sqs = aws_session.resource('sqs')
-
-    c.execute("SELECT * FROM query WHERE status = 'PHASE1'")
-    created_queries = c.fetchall()
-    for created_query in created_queries:
-        subqueries = list()
-        since = pendulum.instance(created_query['since']).int_timestamp
-        until = pendulum.instance(created_query['until']).int_timestamp
-        # one subquery per day in the interval:
-        number_of_subqueries = (pendulum.utcfromtimestamp(until) - pendulum.utcfromtimestamp(since)).days + 1
-        interval = (until - since) // number_of_subqueries
-        for x in range(number_of_subqueries):
-            aux_until = since + interval
-            if x == number_of_subqueries - 1:
-                aux_until = until
-            subqueries.append({'query_alias': created_query['query_alias'],
-                               'since': datetime.utcfromtimestamp(since),
-                               'until': datetime.utcfromtimestamp(aux_until),
-                               'complete': False})
-            since = aux_until
-        dataText = ','.join(c.mogrify('(%s,%s,%s,%s)',
-                                      (subquery['query_alias'],
-                                       subquery['since'],
-                                       subquery['until'],
-                                       subquery['complete'])).decode('utf-8') for subquery in subqueries)
-        c.execute("INSERT INTO subquery (query_alias, since, until, complete) VALUES " + dataText)
-        c.execute("UPDATE query SET status = 'PHASE2' WHERE query_alias = %s", (created_query['query_alias'],))
-        conn.commit()
-
-    subqueries_queue = sqs.get_queue_by_name(QueueName='subqueries')
+    subqueries_queue = sqs.get_queue_by_name(QueueName='twitter_scraping')
     subqueries_queue.purge()
 
-    # if there are queries that were not totally retrieved...
-    c.execute("SELECT * FROM query WHERE status = 'PHASE2'")
+    c.execute("""
+        insert into twitter_scraping_subquery (query_alias, since)
+        select query_alias,
+               generate_series(since,
+                               until - interval '1 second',
+                               subquery_interval_in_seconds)
+        from twitter_scraping_query,
+             project
+        where twitter_scraping_query.project_name = project.project_name and
+              project.active
+        on conflict do nothing;
+    """)
+    conn.commit()
+
+    c.execute("""
+        select twitter_scraping_subquery.query_alias,
+               search_terms,
+               language,
+               extract(epoch from twitter_scraping_subquery.since)::integer as since,
+               extract(epoch from least(twitter_scraping_subquery.since + subquery_interval_in_seconds,
+                                        twitter_scraping_query.until,
+                                        min(twitter_dry_tweet.published_at) + interval '1 second')
+                   ::timestamp(0))::integer as until,
+               extract(epoch from tolerance_in_seconds)::integer as tolerance_in_seconds
+        from twitter_scraping_subquery left outer join twitter_dry_tweet using (query_alias, since) ,
+             twitter_scraping_query,
+             project
+        where twitter_scraping_query.project_name = project.project_name and
+              project.active and
+              twitter_scraping_query.query_alias = twitter_scraping_subquery.query_alias and
+              not twitter_scraping_subquery.complete and
+              (twitter_dry_tweet.published_at is null or
+               twitter_dry_tweet.published_at >= twitter_scraping_subquery.since)
+        group by twitter_scraping_subquery.query_alias,
+                 twitter_scraping_subquery.since,
+                 subquery_interval_in_seconds,
+                 twitter_scraping_query.until,
+                 tolerance_in_seconds,
+                 search_terms,
+                 language;
+    """)
+
     incomplete_queries = c.fetchall()
     for query in incomplete_queries:
-        # if there are queries that were not totally retrieved...
-        c.execute("SELECT * FROM subquery WHERE NOT complete AND query_alias = %s", (query['query_alias'],))
-        incomplete_subqueries = c.fetchall()
-
-        for incomplete_subquery in incomplete_subqueries:
-            subquery = {}
-            subquery['query_alias'] = incomplete_subquery['query_alias']
-            subquery['query'] = query['query']
-            subquery['language'] = query['language']
-            subquery['since'] = incomplete_subquery['since'].isoformat()
-            subquery['until'] = incomplete_subquery['until'].isoformat()
-            subquery['seconds_of_tolerance'] = query['seconds_of_tolerance']
-            subqueries_queue.send_message(MessageBody=json.dumps(subquery))
+        subqueries_queue.send_message(MessageBody=json.dumps(query))
 
     conn.close()
+
+
+if __name__ == '__main__':
+    main()
