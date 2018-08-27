@@ -11,7 +11,7 @@ def main():
     config = configparser.ConfigParser()
     config.read(os.path.join(os.path.dirname(__file__), 'config.ini'))
     conn = psycopg2.connect(host=config['database']['host'],
-                            dbname=config['database']['dbname'],
+                            dbname=config['database']['db_name'],
                             user=config['database']['user'],
                             password=config['database']['password'])
     c = conn.cursor(cursor_factory=extras.RealDictCursor)
